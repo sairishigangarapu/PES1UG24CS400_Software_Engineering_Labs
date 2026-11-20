@@ -6,3 +6,13 @@ dist/
 shared-local-instance.db
 dynamodb-local-metadata.json
 *.db
+
+/backend/venv/
+
+# Python virtual environments and test/cache artifacts
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.hypothesis/
