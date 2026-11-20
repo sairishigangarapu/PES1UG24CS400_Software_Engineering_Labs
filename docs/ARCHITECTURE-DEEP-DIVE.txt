@@ -1,0 +1,492 @@
+================================================================================
+RocketMoney — INTRICATE ARCHITECTURAL EXPLANATION
+Personal Subscription & Recurring Expense Auditor with Shared Rooms
+Generated 2026-09-28 from the as-built codebase (M0-M4c + ship-readiness).
+================================================================================
+
+TABLE OF CONTENTS
+  1. Product vision and domain narrative
+  2. Architectural style and why it won (ADR-001)
+  3. System decomposition: layers, modules, processes
+  4. Request lifecycle (a call, end to end)
+  5. Domain model, invariants, and state machines
+  6. DynamoDB multi-table design (ADR-003 + M3)
+  7. Concurrency: lease locks (ADR-004)
+  8. Reliability: transactional outbox + worker (ADR-005)
+  9. Identity: WorkOS boundary and sync lifecycle (ADR-002/010)
+ 10. Rooms, invitations, and the transfer-or-freeze rule (ADR-007)
+ 11. Expenses, balances, and settlements: the hybrid ledger (ADR-008)
+ 12. Subscriptions, analysis, SkillOpt port (ADR-006)
+ 13. Notifications: webhook-first transport
+ 14. Cancellation guidance and concierge
+ 15. Reports and metrics
+ 16. Authentication vs authorization (SEC-002)
+ 17. Frontend: Brutalist system (ADR-009)
+ 18. Startup: fail-fast (NFR-005)
+ 19. Shutdown: graceful drain (NFR-006)
+ 20. Observability and log discipline
+ 21. Testing architecture and the concurrency matrix
+ 22. CI/CD and branch protection
+ 23. Deployment topology and production key insertion
+ 24. Threat model and residual risks
+ 25. Scaling story and extraction path
+ 26. Decision log (Q0-Q7) and phase gates
+ 27. Glossary
+
+--------------------------------------------------------------------------------
+1. PRODUCT VISION AND DOMAIN NARRATIVE
+--------------------------------------------------------------------------------
+RocketMoney answers one question for an individual ("what recurring charges drain me,
+when do they renew, and how do I kill the unwanted ones?") and extends it to groups:
+a shared subscription (Netflix across five people) becomes a Room with one owner,
+many members, one linked subscription row, an immutable expense log, materialized
+pairwise balances, a settlement lifecycle, invitations, renewal alerts, and an
+activity trail. The tagline used internally is "Splitwise on steroids for shared
+subscriptions," but the domain model is purpose-built, not cloned: ownership,
+transfer-or-freeze lifecycle, opaque invite tokens, and the hybrid ledger are all
+original answers to this product's constraints (idempotency under retry, auditability
+of money movement, survival of owner disappearance).
+
+--------------------------------------------------------------------------------
+2. ARCHITECTURAL STYLE AND WHY IT WON (ADR-001)
+--------------------------------------------------------------------------------
+Style: LAYERED MODULAR MONOLITH. One Fastify deployable (Node 20), one React frontend,
+twelve DynamoDB tables, event-driven behavior INTERNAL to the monolith (transactional
+outbox + worker loops), never a separate messaging estate.
+
+Layers, top to bottom:
+  Presentation (React TSX) -> API/HTTP (Fastify routes + authN/authZ boundary) ->
+  Application services (rooms, expenses, subscriptions, analysis, notify, reports,
+  metrics, sync, worker) -> Data-access seam ({doc, tables} injected into every
+  service function; no service imports a client singleton) -> DynamoDB.
+
+Why not microservices: team of undergraduates, single primary store, no evidence any
+slice needs independent scaling or deployment. Lab 3 section 10 records the rejection;
+ADR-001 freezes it. The outbox consumer functions are deliberately shaped as the
+future service boundaries, so extraction later is a packaging exercise, not a rewrite.
+Why not bare client-server two-tier: it describes only the UI<->API edge and says
+nothing about decomposing the domain. Why not EDA-as-primary: events are the
+communication mechanism (outbox rows), not the decomposition principle; exactly-once
+is never claimed, at-least-once plus idempotent consumers is the contract (NFR-003).
+
+--------------------------------------------------------------------------------
+3. SYSTEM DECOMPOSITION: LAYERS, MODULES, PROCESSES
+--------------------------------------------------------------------------------
+Runtime processes in production:
+  (a) API server (src/server.js): serves HTTPS, owns fail-fast boot, graceful
+      shutdown, and the two opt-in background intervals (outbox poller, renewal
+      scanner). Stateless: any number of replicas may run; correctness never depends
+      on which replica serves a request, because mutual exclusion lives in DynamoDB
+      leases, not in process memory.
+  (b) Optional external worker: the same pollOnce() function can run in a separate
+      process/container; claims are lease-guarded so API-embedded and external
+      workers never double-process.
+  (c) Frontend static bundle (dist/): no secrets, talks to the API base URL only.
+  (d) DynamoDB (12 tables, on-demand billing in MVP).
+  (e) External systems behind adapters: WorkOS (identity + webhook events),
+      notification webhook receiver (any URL), SkillOpt endpoint (optional),
+      banking APIs (stretch; CSV import is the built path).
+
+Module inventory (backend/src):
+  errors.js   typed HTTP errors (400/401/403/404/409/501 + domain codes)
+  ids.js      opaque ids (rm_/ex_/st_/ev_/sb_), 256-bit invite tokens, lock owners
+  db.js       DynamoDB document-client factory (real chain vs local endpoint)
+  tables.js   table-name map from DYNAMODB_TABLE_PREFIX (env isolation)
+  schema.js   frozen M3 table/GSI definitions + ensureTables() for tests/dev
+  locks.js    lease acquire/release/withLock, 409-on-contention
+  outbox.js   event constructor, TransactWrite item builder, claim/done (+retry/DLQ
+              transitions live in worker.js reschedule())
+  rooms.js    rooms, memberships, invitations, transfer, remove, freeze, claim
+  expenses.js equal-split math, balances, settlements, rebuild-from-log
+  subscriptions.js  CRUD, single-room link, cancel machine, renewalsDue()
+  transactions.js   CSV import, idempotent per batch+row, merchant normalization
+  analysis.js monthly-cadence detector + SkillOpt port (timeout, fallback, RTT log)
+  notify.js   webhook-first sendNotification, renewal scan, guides, concierge
+  reports.js  anonymized aggregate CSV/PDF
+  metrics.js  burn-rate dashboard figures from materialized rows
+  sync.js     WorkOS webhook verify (official SDK) + idempotent projection +
+              transfer-or-freeze lifecycle
+  auth.js     Bearer JWT via JWKS -> dev seam -> 501 closed (SEC-002 enforcement)
+  worker.js   pollOnce/dispatch/reschedule, scanAllRenewals, distinctOwners
+  server.js   route wiring, error mapping, raw-body webhook parsing, boot/shutdown
+
+--------------------------------------------------------------------------------
+4. REQUEST LIFECYCLE (A CALL, END TO END)
+--------------------------------------------------------------------------------
+Example: POST /api/rooms/:id/expenses with {amountMinor, payerId, participants,
+idempotencyKey} and an identity header.
+  1. Fastify parses JSON (string-first parser preserves raw bytes ONLY for
+     /api/webhooks/*, where signature verification needs them).
+  2. authed() wrapper awaits requireUser(): Bearer JWT -> verify via JWKS (sub =
+     workosUserId); else test seam header if ALLOW_TEST_AUTH=true; else 501.
+     No verified identity ever implies any permission.
+  3. Service layer: requireRole() loads room + membership; non-member -> 404
+     (existence hiding); wrong role -> 403; frozen room -> 409 room-frozen.
+  4. Pure validation first (equalSplit math, remainder-to-payer rule), so malformed
+     input fails before any lock or write.
+  5. withLock() acquires LOCK#ROOM#<id> (conditional Put, 10-30s lease). Loser gets
+     409 lock-contention + client-side backoff (tests encode this contract).
+  6. Inside the lock: re-validate mutable state (frozen? members active?), check the
+     idempotency key (same key -> return original row, zero new writes), then ONE
+     TransactWrite: expense Put (attribute_not_exists) + N balance ADD updates +
+     outbox Put + idempotency Put. All-or-nothing.
+  7. Lock released (holder-verified; stale holders cannot delete a successor lock).
+  8. setErrorHandler maps HttpError codes to status + {error, message}; 500s hide
+     internals; every outcome is structured-logged with op, ids, and duration-safe
+     fields, never secrets.
+
+--------------------------------------------------------------------------------
+5. DOMAIN MODEL, INVARIANTS, AND STATE MACHINES
+--------------------------------------------------------------------------------
+Entities (DynamoDB key roles in parentheses):
+  users(workosUserId): ACTIVE|DEACTIVATED|DELETED projection of WorkOS identity.
+  rooms(roomId): exactly one ownerId always; ACTIVE|FROZEN; at most one
+    subscriptionId via the subscriptions side.
+  memberships(roomId, workosUserId): OWNER|MEMBER, ACTIVE|REMOVED (tombstones kept
+    while the ledger references the user).
+  invitations(token): opaque 256-bit, maxUses/useCount atomically consumed,
+    expiresAt, revoked; carries zero PII.
+  subscriptions(subscriptionId): ownerId + nullable roomId; ACTIVE|CANCELLED|
+    PENDING_CONCIERGE; conciergeAuth text recorded when applicable.
+  transactions(workosUserId, txnId): sha1(source|batch|row) keys make re-imports
+    no-ops; merchantNorm derived; amounts in minor units, refunds negative.
+  expenses(roomId, expenseId): IMMUTABLE (no update/delete API exists);
+    method=EQUAL only in MVP; shares precomputed, remainder to payer.
+  balances(roomId, pairKey "a#b" a<b): B = net a-owes-b (signed); the ONLY mutable
+    money state, always written inside the room lock in the same transaction.
+  settlements(roomId, settlementId): REQUESTED->COMPLETED (guarded transition;
+    repeat completion safe); REJECTED terminal.
+  outbox(eventId): PENDING->CLAIMED->DONE, or ->DLQ after 10 attempts; payloads
+    carry domain ids/versions only.
+  locks(lockKey): {owner, expiry}; expiry is the crash-safety mechanism.
+  idempotency(key "op:"|"wh:"): 7-day TTL; financial and webhook dedupe alike.
+
+Global invariants (each enforced by a conditional write, not by convention):
+  I1 one owner per room at all times (transfer flips both roles atomically).
+  I2 no duplicate memberships (conditional Put; double submit returns existing).
+  I3 no duplicate expenses/settlements per idempotency key (guard row in the bundle).
+  I4 balances always equal log replay (rebuild endpoint asserts it; tests enforce).
+  I5 shared subscription links at most one room (attribute_not_exists(roomId)).
+  I6 frozen rooms reject all writes, keep all history.
+  I7 no blind user deletion while domain rows reference the user.
+
+--------------------------------------------------------------------------------
+6. DYNAMODB MULTI-TABLE DESIGN (ADR-003 + M3)
+--------------------------------------------------------------------------------
+Twelve tables (Q3 decision: multi-table for per-aggregate clarity, IAM, TTL, and
+independent evolution; single-table rejected on record). On-demand billing until
+measured load. Region: single-region MVP. Money: integer minor units everywhere;
+timestamps ISO-8601 UTC; optimistic `v` counters on hot aggregates.
+Access patterns drive everything (full matrix in docs/ARCHITECTURE.md section 2):
+profile by id; subscriptions by owner (gsi1-owner) and by room (sparse gsi2-room);
+members by room and rooms-by-user (gsi1-user); expenses/settlements/balances by room;
+invites by token and by room (gsi1-room); due outbox rows (sparse gsi1-due on
+status+nextAttemptAt, KEYS_ONLY to stay small); idempotency by key (TTL 7d).
+Hot-partition review: keys fan out by roomId/workosUserId (no global monotonic keys);
+room capacity default 20 bounds TransactWrite fan-out; DONE outbox rows older than
+24h are worker-deleted. One real Local-vs-cloud lesson is documented: KEYS_ONLY
+indexes never project business attributes, so the worker fetches the full base row
+after claiming (claimDueEvent returns ALL_NEW attributes) instead of widening the
+index. Item sizes stay under 10KB by construction (capped participants, id-only
+payloads).
+
+--------------------------------------------------------------------------------
+7. CONCURRENCY: LEASE LOCKS (ADR-004)
+--------------------------------------------------------------------------------
+DynamoDB conditional/lease locks, no external lock service. Keys: LOCK#ROOM#<id>,
+LOCK#SUB#<id>, LOCK#OUTBOX#<eventId>, LOCK#ANALYSIS#<user>, LOCK#TEST#*. Leases
+10-30s per operation class (analysis heartbeats only for long jobs). Acquire =
+conditional Put (absent OR expired); release verifies holder (stale holders cannot
+delete successors — tested); crash = expiry + writer-side fencing. Contention =
+409 + Retry-After hint, client backs off (the integration suite literally encodes
+client-retry behavior). Documented per use: WHAT (room mutations, expense/settle,
+transfer, invite consume, outbox claim, scheduled scan), WHY (read-modify-write
+races on balances/memberships), HOW contention behaves, WHAT a crashed holder
+leaves behind. NFR-004/NFR-008 gate it; the M5 matrix double-hammers every path.
+
+--------------------------------------------------------------------------------
+8. RELIABILITY: TRANSACTIONAL OUTBOX + WORKER (ADR-005)
+--------------------------------------------------------------------------------
+Every side-effecting mutation persists (domain rows + balance deltas + outbox row +
+idempotency guard) in ONE TransactWrite, so effects are never lost on crash and
+never duplicated on retry. Workers claim via conditional PENDING->CLAIMED flip
+(single winner proven by test), dispatch by event type, mark DONE; failures get
+exponential backoff reschedule, then DLQ with the error recorded. Catalog:
+SubscriptionDetected/RenewalApproaching, RoomMemberJoined/Removed/Updated/Frozen/
+Unfrozen, ExpenseCreated/Updated, SettlementRequested/Completed,
+CancellationRequested/Completed, ReportRequested. Delivery contract, stated loudly:
+AT-LEAST-ONCE + IDEMPOTENT CONSUMERS; exactly-once is never claimed. The worker runs
+embedded (OUTBOX_POLL_MS, off by default) or standalone — claims are lease-guarded
+either way. A real double-delivery bug (scan emitted AND sent; worker sent again)
+was caught by test and fixed by splitting duties: scans emit only, workers deliver
+only — the single most valuable test failure in the project.
+
+--------------------------------------------------------------------------------
+9. IDENTITY: WORKOS BOUNDARY AND SYNC LIFECYCLE (ADR-002/010)
+--------------------------------------------------------------------------------
+"WorkOS owns identity. RocketMoney owns application state." The app stores workosUserId
+(the stable key; email is NEVER a join key), profile copies, preferences, status, and
+domain links — never passwords, secrets, or raw WorkOS credentials. Sync transport
+(Q1): WorkOS Events delivered by webhooks, signature-verified with the OFFICIAL SDK
+(constructEvent; two real wire-format bugs were found empirically: the event name
+travels in `event` not `type`, and user fields arrive camelCased post-deserialization).
+Handler semantics: dedupe on WorkOS event ID first (idempotency table), conditional
+create, version/timestamp-guarded updates so out-of-order redelivery never regresses
+state, poll/replay recovery path, poison to DLQ. Lifecycle (Q2, binding): deletion or
+deactivation never hard-deletes; it flips users.status and runs transfer-or-freeze
+over owned rooms (freeze = reads allowed, writes 409, invites revoked, history kept;
+unfreeze on member claim). API exit without a named successor is rejected 4xx, so no
+room is ever ownerless through the normal path. AuthN (WorkOS: who) and AuthZ
+(RocketMoney + room role: what) are separate layers; a valid session alone opens
+nothing (SEC-002), and non-members get 404 to hide existence.
+
+--------------------------------------------------------------------------------
+10. ROOMS, INVITATIONS, AND THE TRANSFER-OR-FREEZE RULE (ADR-007)
+--------------------------------------------------------------------------------
+Room = id, name, owner, members/roles, one subscription link, cost config, invites,
+settings, activity, ACTIVE|FROZEN. Owner caps (create, attach, invite, manage,
+transfer, cancel workflows) vs member caps (join, view, record/pay, settle) are
+enforced server-side in requireRole(), tested as a matrix. Invitation flow: owner
+generates opaque token (expiry, maxUses, revocation) -> shares link -> invitee
+authenticates via WorkOS -> atomic token consume (single conditional Update, so N
+simultaneous joiners on a 1-use token yield exactly one member) -> conditional
+membership Put -> RoomMemberJoined event. All token-failure modes share one error
+shape (no oracle for attackers). Capacity enforced (default 20). Removal is
+owner-only, never self-removal (transfer first), and blocked on nonzero net balance
+— enforced over REAL balances since M4b, proven by test. validateTransfer() is a
+pure function (no-room/frozen/not-owner/bad-successor/self) unit-tested without a
+database; the transactional path re-checks everything under lock.
+
+--------------------------------------------------------------------------------
+11. EXPENSES, BALANCES, AND SETTLEMENTS: THE HYBRID LEDGER (ADR-008)
+--------------------------------------------------------------------------------
+MVP split method is EQUAL ONLY (Q4). equalSplit() works in minor units with the
+remainder-paise-to-payer rule (deterministic; e.g. 100001/5 -> payer 20001, rest
+20000). Orientation convention, fixed once: pairKey "a#b" (a<b), B = net a-owes-b;
+obligationDelta(debtor, creditor, amount) folds any obligation into that frame, and
+settlements apply as NEGATIVE obligations (a settlement bug that ADDED debt instead
+of canceling it was caught by test: net 40000 instead of 0 — the suite, not review,
+found it). Expense creation bundles expense row + balance ADDs + outbox + idempotency
+guard in one TransactWrite under the room lock (EXP-003). Settlements run
+REQUESTED->COMPLETED with repeat-completion safety. Balances are materialized for
+fast reads AND rebuildable from the immutable log (rebuild endpoint asserts match;
+M5 requires it). Per-member netting is presentation logic over pairs. getBalances
+serves the UI tables; netBalanceForUser() powers the removal gate. Concurrency
+proofs: same-key double submit -> one row (winner returned to loser); concurrent
+expense+settlement with client retry -> replay-identical balances.
+
+--------------------------------------------------------------------------------
+12. SUBSCRIPTIONS, ANALYSIS, SKILLOPT PORT (ADR-006 + FR-001)
+--------------------------------------------------------------------------------
+Subscriptions: personal (roomId absent) vs shared (exactly one room link, enforced by
+attribute_not_exists). Cancel machine ACTIVE->CANCELLED directly or via
+PENDING_CONCIERGE with recorded authorization text. renewalsDue() filters owned
+actives within 72h. Transactions enter via CSV import (header date,merchant,amount;
+sha1(source|batch|row) keys make re-uploads no-ops; refunds negative; merchants
+normalized) — live Plaid sync is an explicitly documented stretch adapter, not a
+hole. The baseline detector groups normalized merchants, requires same-amount
+charges on ~30-day cadence within tolerance across CONSECUTIVE windows (a 6-month
+gap pair is correctly rejected), and projects monthly cost + next renewal. SkillOpt
+sits strictly behind the RecurringAnalysisPort: optional endpoint, 5s timeout,
+identical output schema, any failure -> deterministic baseline, and every call logs
+wall-clock RTT + fallback flag (NFR-007). The core works with SkillOpt absent;
+"AI-powered" claims require measured p50/p95, none are made.
+
+--------------------------------------------------------------------------------
+13. NOTIFICATIONS: WEBHOOK-FIRST TRANSPORT
+--------------------------------------------------------------------------------
+sendNotification() POSTs {toUserId, subject, body, sentAt} to NOTIFY_WEBHOOK_URL
+(5s timeout, HMAC-SHA256 X-RocketMoney-Signature when a secret is set); any failure
+or absence falls back to a structured log line without throwing — mirroring the
+SkillOpt fallback philosophy. Durability is the outbox event's job, not the POST's:
+scanRenewals() emits SubscriptionRenewalApproaching rows; the worker delivers them
+to the webhook. A daily run is SCAN_INTERVAL_MS=86400000 (opt-in; the timer is
+shutdown-aware). Repeat reminders are intentional (a still-due sub re-alerts daily);
+per-day dedup is tracked hardening, not implemented. Signature verified byte-for-byte
+in tests against a live local receiver, including the dead-URL fallback path.
+
+--------------------------------------------------------------------------------
+14. CANCELLATION GUIDANCE AND CONCIERGE
+--------------------------------------------------------------------------------
+Static provider map (Netflix/Spotify/YouTube with steps + portal links) plus an
+explicit unsupported state — unknown providers return supported:false, never a dead
+link (FR-004 acceptance). Concierge (FR-006): owner-only, requires real authorization
+text (>=10 chars, recorded), flips to PENDING_CONCIERGE, emits CancellationRequested
+only for providers flagged concierge-capable (currently none — so no phantom
+workflows), and completes via the same confirm path as manual cancellation. Every
+transition is outbox-audited.
+
+--------------------------------------------------------------------------------
+15. REPORTS AND METRICS
+--------------------------------------------------------------------------------
+Reports (FR-005): full-table scan of ACTIVE subscriptions aggregated by provider
+(count + monthlyMinor), rendered as CSV (header + rows) or real PDF (pdfkit,
+%PDF-magic asserted). Anonymity is a TESTED property: the suite asserts no user id,
+email, or @ appears in CSV output. Metrics (FR-008, NFR-002): dashboard() sums owned
+actives (personal burn) plus per-room outstanding balances from materialized rows —
+no raw-transaction rescan, protecting the 2-second budget (measured properly in M6).
+
+--------------------------------------------------------------------------------
+16. AUTHENTICATION VS AUTHORIZATION (SEC-002)
+--------------------------------------------------------------------------------
+requireUser() chain: (1) Bearer RS256 JWT verified against WORKOS_JWKS_URL (sub =
+identity; tampered/unknown-kid/missing-sub all 401; proven with real RSA + local
+JWKS in tests); (2) DEV-ONLY x-test-user seam iff ALLOW_TEST_AUTH=true; (3) else 501
+auth-not-configured — fail closed, never open. Every room/resource operation then
+checks membership + role independently of session validity. Dummy keys satisfy boot
+only and authenticate nobody; that sentence is load-bearing for the viva. Prod
+readiness explicitly requires: real JWKS URL, seam absent, webhook secret real,
+IAM-scoped keys, HTTPS webhook endpoint registered.
+
+--------------------------------------------------------------------------------
+17. FRONTEND: BRUTALIST SYSTEM (ADR-009)
+--------------------------------------------------------------------------------
+React TSX, Vite build, zero fake data. Tokens: paper/ink/accent/ok palette, 3px
+borders, 5px hard shadows, uppercase display type, mono body, tables with inverted
+headers, badges for OWNER/FROZEN/settled, explicit red destructive states. Views:
+Rooms list (role/frozen badges), create, join-by-token; Room detail (members + net
+balances, invite box with copy, ₹ expense form with payer/participant pickers,
+expenses table, balances table with owes-sentences, settle flow with confirm,
+danger zone transfer/remove, frozen banner with claim button); Subscriptions
+(track/share-to-room/cancel/guide); Reports (burn dashboard, CSV import + analyze
+with RTT display, CSV/PDF downloads). The header "Acting as (test)" box IS the dev
+seam, labeled as such. A11y gates (not trade-offs): real labels, focus-visible
+rings, 16px body, alert roles, keyboard-operable cards, 360px responsive. Typed
+api.ts client; money converted ₹<->minor at the boundary, integers only inside.
+
+--------------------------------------------------------------------------------
+18. STARTUP: FAIL-FAST (NFR-005)
+--------------------------------------------------------------------------------
+Load config -> require WORKOS_API_KEY, AWS_REGION, DYNAMODB_TABLE_PREFIX (names
+only in diagnostics, values never logged) -> validate WorkOS/DynamoDB posture ->
+init -> listen. Any mandatory gap: clear component/reason/retryable diagnostic +
+non-zero exit; the M0 smoke suite asserts exit 1 naming the keys. Local DynamoDB
+mode swaps in dummy credentials ONLY when DYNAMODB_ENDPOINT is set (never against
+real AWS). /health and /ready exist; deep dependency checks are tracked hardening.
+CI smoke job boots the server and asserts /health ok plus unauthenticated /api/rooms
+-> 501 (fail-closed proof on every build).
+
+--------------------------------------------------------------------------------
+19. SHUTDOWN: GRACEFUL DRAIN (NFR-006)
+--------------------------------------------------------------------------------
+SIGTERM/SIGINT: stop background intake first (intervals cleared) -> stop accepting
+new requests -> drain in-flight (Fastify close) -> 10s bounded window -> clean exit;
+overrun logs and exits 1, never silently. Proven in tests (exit 0 after drain) and
+in CI's smoke step (kill -> clean-exit asserted in logs). No in-flight financial
+write is ever half-applied: TransactWrite atomicity plus idempotency keys make
+interrupted-then-retried work converge.
+
+--------------------------------------------------------------------------------
+20. OBSERVABILITY AND LOG DISCIPLINE
+--------------------------------------------------------------------------------
+Every log line is JSON with ts/level/component plus request/user/room/op/event/lock
+ids, error codes, and outcomes. NEVER logged: passwords, secrets, tokens, raw bank
+data, or unnecessary financial PII (asserted by secret-scan CI + the report
+anonymity test). Worker, scanner, notifier, and analysis all emit per-invocation
+records (including RTT/fallback flags), so the system's expensive questions — "did
+the alert go out?", "was SkillOpt used?", "which worker owns this event?" — are
+answerable from logs alone.
+
+--------------------------------------------------------------------------------
+21. TESTING ARCHITECTURE AND THE CONCURRENCY MATRIX
+--------------------------------------------------------------------------------
+Three tiers: unit (pure math/guards/parsers, no DB: 22 tests), integration
+(DynamoDB Local 1.25.1, official S3 build: 32 tests), HTTP smoke (full request
+paths incl. error codes). Shared-table discipline: unique ids per test, files run
+with --test-concurrency=1, worker tests drain backlog first with run-unique tags
+(stale-row double-delivery was caught and fixed this way). The matrix that must
+always pass: double join, single-use join race, double settlement completion,
+duplicate webhook delivery, duplicate outbox claim (single winner), lock contention
++ expiry + stale-holder release, worker crash between claim and done (CLAIMED +
+lease recovery redrives), fail-fast table, shutdown drain, webhook-down fallback,
+SkillOpt-down fallback, GSI-lag-tolerant polling. The full TC catalog with
+requirement mapping is docs/TEST-PLAN.md (25 TCs); every requirement maps to >=1 TC.
+
+--------------------------------------------------------------------------------
+22. CI/CD AND BRANCH PROTECTION
+--------------------------------------------------------------------------------
+.github/workflows/ci.yml, three jobs: backend (npm ci, unit, integration against
+the official amazon/dynamodb-local service container), smoke (boot probe +
+fail-closed 501 assertion), frontend (npm ci, tsc, vite build). main is protected
+via API: PR-only, backend+frontend checks required, admins enforced. Workflow
+history on the project: feature/<n>-<slug> branches, conventional commits,
+one-issue-one-PR, stacked PRs with retargeting where phases overlapped
+(#15 stacked on #13's branch, #19 on #8's), stale branches deleted after merge.
+
+--------------------------------------------------------------------------------
+23. DEPLOYMENT TOPOLOGY AND PRODUCTION KEY INSERTION
+--------------------------------------------------------------------------------
+Reference topology: static frontend (S3+CloudFront or Netlify/Vercel) -> single or
+replicated Fastify containers (App Runner/ECS/EC2 + Docker; backend/Dockerfile
+provided, HEALTHCHECK on /health) -> DynamoDB (12 rm-prod-* tables, on-demand) ->
+WorkOS (identity + webhooks) + notification webhook receiver. The app tier is
+stateless, so replicas scale horizontally; leases keep them correct. Key insertion
+order: (1) create tables with the repo's own ensureTables (one node command);
+(2) IAM user rocketmoney-app with the least-privilege policy (12 tables + indexes
+only) -> access key pair (shown once); (3) env: real WORKOS_API_KEY/_WEBHOOK_SECRET/
+_JWKS_URL, region, rm-prod- prefix, app IAM keys (or role: omit keys), webhook URL
+(+secret), OUTBOX_POLL_MS=5000, SCAN_INTERVAL_MS=86400000; DELETE DYNAMODB_ENDPOINT
+and ALLOW_TEST_AUTH; (4) register https webhook endpoint in WorkOS, send test event;
+(5) verify health/401s/full click-through; (6) delete bootstrap admin keys. Test
+matrix for prod: health ok, unauthenticated reads 401/501, room lifecycle over
+HTTPS, webhook 202 + user row, zero secrets in logs.
+
+--------------------------------------------------------------------------------
+24. THREAT MODEL AND RESIDUAL RISKS
+--------------------------------------------------------------------------------
+Adversaries considered: stranger probing ids (answered by 404-hiding + role checks),
+member escalating to owner caps (server-side matrix, tested), invite-token guessing
+(256-bit, single error shape, revocation, expiry, capacity), replay attacks
+(idempotency keys + webhook event dedupe + settlement guards), credential theft
+(no passwords stored; tokenized integrations; .env gitignored + gitleaks CI),
+log/PII leakage (discipline + tests), provider spoofing (HMAC on both webhook
+directions). Residual risks, stated openly: no rate limiting yet (#20), no security
+headers/CORS lockdown yet (#20), scheduler is an interval not a managed cron,
+single-region, on-demand billing unguarded, 10k-row dashboard budget unmeasured
+(M6 gate), per-day alert dedup unspecified, live bank sync unbuilt (CSV only).
+Nothing here is hidden; each maps to an issue or gate.
+
+--------------------------------------------------------------------------------
+25. SCALING STORY AND EXTRACTION PATH
+--------------------------------------------------------------------------------
+Today: stateless replicas + DynamoDB on-demand + worker concurrency — sufficient for
+the MVP envelope. Ceilings, honestly: analysis/report scans (full-table/owner scans
+grow with data), single-region fate-sharing, one deployable for all modules. When a
+ceiling binds, the split order is already determined by the seams: outbox consumers
+(notification dispatch, analysis) extract first (they touch the least shared state),
+then reporting, then rooms/expenses last (they share the ledger tables, which would
+need ownership decisions). The {doc, tables} seam means extracted services keep
+their code nearly verbatim. This paragraph is the viva answer to "monoliths can't
+scale": correct, eventually — and here is the measured, pre-planned exit.
+
+--------------------------------------------------------------------------------
+26. DECISION LOG (Q0-Q7) AND PHASE GATES
+--------------------------------------------------------------------------------
+Q0 repo split (SoftwareEngg archive vs RocketMoney engineering) | Q1 WorkOS
+Events+webhooks | Q2 transfer-or-freeze (owner names successor or room freezes) |
+Q3 multi-table DynamoDB | Q4 equal-split MVP | Q5 hybrid ledger | Q6 SkillOpt
+sync-with-fallback, RTT/latency metrics | Q7 Fastify JS + React TSX, OLTP-first.
+Gates: M0 init, M1 requirements (#4), M2 architecture (ADRs 001-010), M3 design
+(#5, DYNAMODB-DESIGN.md), M4 slices (#6 rooms, #7 expenses, #8 subs/notify/reports,
+#14 frontend), M5 tests + CI (#9 TEST-PLAN.md, #10 ci.yml), M6 hardening (#18 auth/
+worker/docs, #20 security), M7 release. Full traceability requirement->issue->
+component->ADR->code->test->result is maintained in REQUIREMENTS.md + TEST-PLAN.md.
+
+--------------------------------------------------------------------------------
+27. GLOSSARY
+--------------------------------------------------------------------------------
+SoT (source of truth) | OLTP (short transactional operations this backend favors) |
+GSI (DynamoDB global secondary index) | TransactWrite (all-or-nothing multi-item
+write) | lease (time-bound lock with expiry-as-crash-safety) | outbox (durable
+event rows written atomically with domain state) | idempotency key (client token
+making retries safe) | tombstone (REMOVED membership kept for audit) | fail-fast
+(refuse to boot broken) | fail-closed (refuse access when auth unconfigured) |
+KEYS_ONLY (index projecting keys alone — the lesson that fixed claimDueEvent) |
+minor units (integer paise/cents; floats never touch money) | SoT split ("WorkOS
+owns identity. RocketMoney owns application state.").
+
+================================================================================
+END. Total: 27 sections. Anything this file claims, the code, tests, ADRs, or
+phase issues corroborate; anything corroborated nowhere is marked as tracked
+future work, not as fact.
+================================================================================
